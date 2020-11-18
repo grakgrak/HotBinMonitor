@@ -1,0 +1,1 @@
+Monitors the temp of the compost bin

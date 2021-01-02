@@ -5,14 +5,17 @@
 #include <ESP8266WiFi.h>
 #include "..\..\Credentials.h" // contains definitions of WIFI_SSID and WIFI_PASSWORD
 
-#define HOSTNAME "HotBinMonitor"
+#define HOSTNAME "HotBinMonitor2"
 const char *ssid = WIFI_SSID;
 const char *password = WIFI_PASSWORD;
 
 #define WIFI_CONNECT_TIMEOUT 15000
 #define MQTT_HOST IPAddress(192, 168, 1, 210)
 #define MQTT_PORT 1883
-#define PUBLISH_FREQ_SECS 60
+#define PUBLISH_FREQ_SECS 60*6
+
+#define SENSOR_1_PIN    12
+#define SENSOR_2_PIN    14
 
 AsyncMqttClient mqttClient;
 WiFiEventHandler wifiConnectHandler;
@@ -35,32 +38,98 @@ public:
     double Average() { return _average; }
 };
 
-ArithmeticMean sensorValue;
+ArithmeticMean sensorValue1;
+ArithmeticMean sensorValue2;
 
 int rawValue;
 
 //--------------------------------------------------------------------
-// Voltage divider details
-const float R1 = 0;  // Fixed resistor next to thermistor. 0 if not required.
-const float R2 = 6.8;  // Fixed resistor on other side of divider
-const float Vcc = 3.3;  // Input voltage
 
 // Get three measurements like below, then use
 // http://www.thinksrs.com/downloads/programs/Therm%20Calc/NTCCalibrator/NTCcalculator.htm
+// 100K thermistor
 //  100.0C = 6.7kohm
 //   34.4C = 60.7kohm
 // -13.0C = 624.0kohm
-const float BETA = 3855;
-const float NOM_RESIST = 75500;    // 90496;
-const float NOM_TEMP = 25;
+// 25.0C = 75500 ohm
+// beta = 3855
 
+// 10K Thermistor
+// -14.5C = 63.0kohm
+//   19.0C = 12.0kohm
+//  100.0C = 0.7kohm
+// 25.0C = 9250ohm
+// beta = 3740
+// const float BETA = 3840;
+// const float NOM_RESIST = 8830;
+// const float NOM_TEMP = 25;
+
+const float Vcc = 3.3;  // Input voltage
+const float SERIES_RESIST = 99800;  // 100K but measured as 99.8K
+// const float BETA = 3950;
+const float BETA = 3380;
+const float NOMINAL_RESIST = 10000;
+const float NOMINAL_TEMP = 25;
+const float ZERO_OFFSET = 2.25;
+
+//--------------------------------------------------------------------
 float resistanceToCelsius(float resistance) {
   // Simplified Steinhart-Hart
-  float temp = log(resistance / NOM_RESIST) / BETA;
-  temp += 1.0 / (NOM_TEMP + 273.15);
-  temp = 1 / temp;
+  float temp = log(resistance / NOMINAL_RESIST) / BETA;
+  temp += 1.0 / (NOMINAL_TEMP + 273.15);
+  temp = 1.0 / temp;
   temp -= 273.15; // convert to C
-  return temp;
+  return temp + ZERO_OFFSET;
+}
+
+//--------------------------------------------------------------------
+float ReadSensor1(uint8_t pin)
+{
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);    // switch on the sensor
+ 
+    // read the sensor
+    rawValue = analogRead(A0);
+    
+    pinMode(pin, INPUT);    // switch off the sensor
+
+    float voltage = rawValue / 1024.0;
+    float resistance = (SERIES_RESIST * voltage) / (Vcc - voltage);
+
+    Serial.print(pin);
+    Serial.print(": Raw=");
+    Serial.print(rawValue);
+    Serial.print(" Resistance=");
+    Serial.print(resistance);
+    Serial.print(" Celsius=");
+    Serial.println(resistanceToCelsius(resistance));
+
+    return resistance;
+}
+
+//--------------------------------------------------------------------
+float ReadSensor(uint8_t pin)
+{
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);    // switch on the sensor
+ 
+    // read the sensor
+    rawValue = analogRead(A0);
+    
+    pinMode(pin, INPUT);    // switch off the sensor
+
+    float voltage = (1023.0 / rawValue) - 1;
+    float resistance = SERIES_RESIST / voltage;
+    
+    Serial.print(pin);
+    Serial.print(": Raw=");
+    Serial.print(rawValue);
+    Serial.print(" Resistance=");
+    Serial.print(resistance);
+    Serial.print(" Celsius=");
+    Serial.println(resistanceToCelsius(resistance));
+
+    return resistance;
 }
 
 //--------------------------------------------------------------------
@@ -138,11 +207,11 @@ void connectToMqtt()
 //------------------------------------------------------------------------
 void publishSensorValue()
 {
-    String val = String( sensorValue.Average());
-    mqttClient.publish("HotBinTemp/value", 0, true, val.c_str());
+    String val = String( resistanceToCelsius(sensorValue1.Average()));
+    mqttClient.publish("HotBinTemp/value1", 0, true, val.c_str());
     
-    val = String( rawValue );
-    mqttClient.publish("HotBinTemp/raw", 0, true, val.c_str());
+    val = String( resistanceToCelsius(sensorValue2.Average()));
+    mqttClient.publish("HotBinTemp/value2", 0, true, val.c_str());
 }
 
 //------------------------------------------------------------------------
@@ -171,58 +240,44 @@ void init_mqtt()
     mqttClient.onConnect(onMqttConnect);
     mqttClient.onDisconnect(onMqttDisconnect);
     mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-
-    connectToWifi();
-}
-//------------------------------------------------------------------------
-void WiFiEvent(WiFiEvent_t event)
-{
-    switch (event)
-    {
-    case WIFI_EVENT_STAMODE_GOT_IP:
-        connectToMqtt();
-        break;
-    case WIFI_EVENT_STAMODE_DISCONNECTED:
-        mqttReconnectTimer.detach();
-        wifiReconnectTimer.once(2, connectToWifi);
-        break;
-    default:
-        break;
-    }
 }
 
+//--------------------------------------------------------------------
 void setup()
 {
+    pinMode(SENSOR_1_PIN, INPUT);
+    pinMode(SENSOR_2_PIN, INPUT);
+
     Serial.begin(115200);
     delay(10);
     //Serial.setDebugOutput(true);
     Serial.println("\nSetup");
 
-    WiFi.onEvent(WiFiEvent);
+    wifiConnectHandler = WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP &ev) 
+    {
+        Serial.println(WiFi.localIP());
+        connectToMqtt();
+    });
 
-    init_OTA();
+    wifiDisconnectHandler = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &ev) 
+    {
+        mqttReconnectTimer.detach();
+        wifiReconnectTimer.once(2, connectToWifi);
+    });
+
     init_mqtt();
+    init_OTA();
+    connectToWifi();
 
     Serial.println("Setup Done.");
 }
 
+//--------------------------------------------------------------------
 void loop()
 {
-    // read the sensor
-    rawValue = analogRead(A0);
-    
-    Serial.print(rawValue);
-
-    float voltage = rawValue / 1024.0;
-    
-    float totalResistance = ((Vcc * R2) / voltage) - R2;
-    float resistance = (totalResistance - R1) * 1000;
-    
-    Serial.print(" temp = ");
-    sensorValue.Update( resistanceToCelsius(resistance));
-    Serial.println(sensorValue.Average());
+    sensorValue1.Update(ReadSensor1(SENSOR_1_PIN));
+    sensorValue2.Update(ReadSensor1(SENSOR_2_PIN));
 
     ArduinoOTA.handle();
-
     delay(5000);
 }
